@@ -1,0 +1,382 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <ArduinoOTA.h>      
+#include <Adafruit_GFX.h>    
+#include <Adafruit_ST7789.h> 
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <SensirionI2CSgp41.h>
+#include <VOCGasIndexAlgorithm.h>
+#include <Preferences.h>     
+#include "time.h"            
+
+const char* ssid = "YOUR_WIFI";
+const char* password = "YOUR_PASSWORD";
+const char* ntpServer = "193.204.114.232"; 
+const long  gmtOffset_sec = 0;     
+const int   daylightOffset_sec = 3600; 
+
+#define TFT_CS   2   
+#define TFT_DC   3   
+#define TFT_RST  4   
+
+#define NEON_ORANGE  0xFDA0  
+#define NEON_CYAN    0x07FF  
+#define NEON_GREEN   0x07E0  
+#define DARK_PANEL   0x194A  
+#define BG_CONTAINER 0x0841  
+#define TEXT_MUTED   0xA514  
+
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+Preferences prefs; 
+WebServer server(80);
+Adafruit_BME280 bme;
+SensirionI2CSgp41 sgp41;
+VOCGasIndexAlgorithm voc_alg;
+
+float temp = 0.0, hum = 0.0, press = 1013.2; 
+int32_t voc_index = 100, last_voc = -1; 
+unsigned long lastUpdate = 0, lastTFTUpdate = 0;
+bool bme_detected = false, wifi_connected_prev = false;
+
+const int history_size = 40; 
+int voc_history[history_size]; 
+float temp_history[history_size];
+float hum_history[history_size];
+float press_history[history_size]; 
+int history_index = 0;
+
+const int web_history_size = 288;
+int web_voc_history[web_history_size]; 
+float web_temp_history[web_history_size];
+float web_hum_history[web_history_size];
+float web_press_history[web_history_size];
+uint16_t web_time_history[web_history_size]; 
+int web_history_index = 0;
+
+int global_max_voc = -1, global_min_voc = 999; uint16_t g_max_voc_t = 0, g_min_voc_t = 0;
+float global_max_tmp = -99.0, global_min_tmp = 99.0; uint16_t g_max_tmp_t = 0, g_min_tmp_t = 0;
+float global_max_hum = -1.0, global_min_hum = 101.0; uint16_t g_max_hum_t = 0, g_min_hum_t = 0;
+float global_max_prs = -1.0, global_min_prs = 9999.0; uint16_t g_max_prs_t = 0, g_min_prs_t = 0;
+
+unsigned long last20MinUpdate = 0, voc_sum_accumulator = 0, voc_samples_counter = 0;
+float temp_sum_accumulator = 0.0, hum_sum_accumulator = 0.0, press_sum_accumulator = 0.0;
+// --- Local Web Dashboard HTML Generation ---
+// --- Local Web Dashboard HTML Generation ---
+// --- Local Web Dashboard HTML Generation ---
+// --- Local Web Dashboard HTML Generation ---
+// --- Local Web Dashboard HTML Generation ---
+void handleRoot() {
+  int max_v = -1, min_v = 999; uint16_t max_vt = 0, min_vt = 0;
+  float max_t = -99.0, min_t = 99.0; uint16_t max_tt = 0, min_tt = 0;
+  float max_h = -1.0, min_h = 101.0; uint16_t max_ht = 0, min_ht = 0;
+  float max_p = -1.0, min_p = 9999.0; uint16_t max_pt = 0, min_pt = 0;
+
+  for (int i = 0; i < web_history_size; i++) {
+    uint16_t t_stamp = web_time_history[i];
+    if (t_stamp == 0) continue; 
+    int vv = web_voc_history[i];
+    if(vv > max_v) { max_v = vv; max_vt = t_stamp; }
+    if(vv < min_v && vv > 0) { min_v = vv; min_vt = t_stamp; }
+    float tt = web_temp_history[i];
+    if(tt > max_t) { max_t = tt; max_tt = t_stamp; }
+    if(tt < min_t && tt > 0.0) { min_t = tt; min_tt = t_stamp; }
+    float hh = web_hum_history[i];
+    if(hh > max_h) { max_h = hh; max_ht = t_stamp; }
+    if(hh < min_h && hh > 0.0) { min_h = hh; min_ht = t_stamp; }
+    float pp = web_press_history[i];
+    if(pp > max_p) { max_p = pp; max_pt = t_stamp; }
+    if(pp < min_p && pp > 900.0) { min_p = pp; min_pt = t_stamp; }
+  }
+
+  auto formatT = [](uint16_t enc) -> String {
+    if (enc == 0) return "--:--";
+    int h = enc / 100; int m = enc % 100;
+    return (h < 10 ? "0" : "") + String(h) + ":" + (m < 10 ? "0" : "") + String(m);
+  };
+
+  String vocColor = "#00ffcc"; if (voc_index > 150) vocColor = "#ff9900"; if (voc_index > 250) vocColor = "#ff3355";
+  String tempColor = "#ff5e62"; if (temp < 19.0) tempColor = "#00b4db"; else if (temp >= 28.0) tempColor = "#ff3355"; else if (temp > 24.5) tempColor = "#ff9900"; 
+  String humColor = "#00ffcc"; if (hum < 35.0) humColor = "#ff9900"; else if (hum >= 75.0) humColor = "#ff3355"; else if (hum > 60.0) humColor = "#00b4db"; 
+
+  String html = "<!DOCTYPE html><html lang='en'><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1' charset='UTF-8'>";
+  html += "<style>body{font-family:'Segoe UI',sans-serif;background:#05070a;color:#f3f4f6;text-align:center;margin:0;padding:20px;}";
+  html += ".container{max-width:480px;margin:auto;} .card{background:#11141a;margin:15px 0;padding:22px;border-radius:20px;border:1px solid #1f2633;box-shadow:0 15px 30px rgba(0,0,0,0.5);}";
+  html += ".graph-container{background:#0a0d14;border-radius:14px;padding:12px 12px 35px 12px;margin-top:15px;border:1px solid #161b26;}";
+  html += ".line-path{fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;} .area-path{stroke:none;opacity:0.12;}";
+  html += ".chart-text{font-size:10px;font-weight:600;text-anchor:middle;} .time-text{font-size:9px;font-weight:700;text-anchor:middle;fill:#00ffcc;}";
+  html += ".telemetry-table{width:100%;border-collapse:collapse;margin-top:10px;font-size:0.85em;background:#0a0d14;border-radius:12px;overflow:hidden;border:1px solid #161b26;}";
+  html += ".telemetry-table th{background:#161b26;color:#6b7c96;padding:10px;font-weight:600;text-transform:uppercase;font-size:0.8em;letter-spacing:1px;}";
+  html += ".telemetry-table td{padding:10px;border-bottom:1px solid #11141a;color:#e5e7eb;} .t-stamp{color:#00ffcc;font-weight:700;font-size:0.9em;}</style>";
+  html += "<script>setInterval(function(){location.reload();},5000);</script></head><body><div class='container'>";
+  html += "<h1 style='font-weight:700;color:#00ffcc;font-size:1.6em;letter-spacing:2px;margin-bottom:20px;'>AIR QUALITY</h1>";
+  
+  // --- CARD 1: AIR QUALITY ---
+  html += "<div class='card'><div class='label'>VOC Index | 5-Min History</div><div class='value' style='color:" + vocColor + ";'>" + String(voc_index) + "<span style='font-size:0.3em;color:#6b7c96;font-weight:400;margin-left:5px;'>idx</span></div>";
+  html += "<div class='graph-container'><svg viewBox='0 0 400 165' width='100%' height='100%'><defs><linearGradient id='g-voc' x1='0%' y1='0%' x2='0%' y2='100%'><stop offset='0%' stop-color='" + vocColor + "'/><stop offset='100%' stop-color='transparent'/></linearGradient></defs>";
+  html += "<line x1='0' y1='15' x2='400' y2='15' stroke='#161b26' stroke-dasharray='4' /><line x1='0' y1='75' x2='400' y2='75' stroke='#161b26' stroke-dasharray='4' /><line x1='0' y1='135' x2='400' y2='135' stroke='#161b26' stroke-dasharray='4' />";
+  String a_voc = "", l_voc = "", t_voc = "";
+  for (int i = 0; i < 24; i++) {
+    int idx = (web_history_index + (web_history_size - 24) + i) % web_history_size;
+    int x = (i * 400) / 23; int val = web_voc_history[idx]; int y = 135 - map(val, 0, 500, 15, 120);
+    if(i==0) a_voc = String(x) + "," + String(y) + " ";
+    a_voc += String(x) + "," + String(y) + " "; l_voc += String(x) + "," + String(y) + " ";
+    if (i % 4 == 0) { 
+      // FIXED: Added an offset buffer padding (+12px) to the very first node string to avoid layout screen clipping
+      int text_x = (i == 0) ? (x + 12) : ((i == 20) ? (x - 8) : x);
+      t_voc += "<text x='" + String(text_x) + "' y='" + String(y - 6) + "' fill='" + vocColor + "' class='chart-text'>" + String(val) + "</text>";
+      t_voc += "<text x='" + String(text_x) + "' y='154' class='time-text'>" + formatT(web_time_history[idx]) + "</text>";
+    }
+  }
+  a_voc += "400,135 0,135";
+  html += "<polygon class='area-path' points='" + a_voc + "' fill='url(#g-voc)' /><polyline class='line-path' points='" + l_voc + "' stroke='" + vocColor + "' />" + t_voc + "</svg></div></div>";
+
+  // --- CARD 2: TEMPERATURE ---
+  html += "<div class='card'><div class='label'>Temperature | 5-Min History</div><div class='value' style='color:" + tempColor + ";'>" + String(temp, 1) + "<span style='font-size:0.3em;color:#6b7c96;font-weight:400;margin-left:5px;'>°C</span></div>";
+  html += "<div class='graph-container'><svg viewBox='0 0 400 165' width='100%' height='100%'><defs><linearGradient id='g-temp' x1='0%' y1='0%' x2='0%' y2='100%'><stop offset='0%' stop-color='" + tempColor + "'/><stop offset='100%' stop-color='transparent'/></linearGradient></defs>";
+  html += "<line x1='0' y1='15' x2='400' y2='15' stroke='#161b26' stroke-dasharray='4' /><line x1='0' y1='75' x2='400' y2='75' stroke='#161b26' stroke-dasharray='4' /><line x1='0' y1='135' x2='400' y2='135' stroke='#161b26' stroke-dasharray='4' />";
+  String a_tmp = "", l_tmp = "", t_tmp = "";
+  for (int i = 0; i < 24; i++) {
+    int idx = (web_history_index + (web_history_size - 24) + i) % web_history_size;
+    int x = (i * 400) / 23; float tv = web_temp_history[idx]; if (tv < 0.0) tv = 0.0; if (tv > 50.0) tv = 50.0; int y = 135 - map((int)(tv * 10), 0, 500, 15, 120);
+    if(i==0) a_tmp = String(x) + "," + String(y) + " ";
+    a_tmp += String(x) + "," + String(y) + " "; l_tmp += String(x) + "," + String(y) + " ";
+    if (i % 4 == 0) {
+      int text_x = (i == 0) ? (x + 12) : ((i == 20) ? (x - 8) : x);
+      t_tmp += "<text x='" + String(text_x) + "' y='" + String(y - 6) + "' fill='" + tempColor + "' class='chart-text'>" + String(tv, 1) + "</text>";
+      t_tmp += "<text x='" + String(text_x) + "' y='154' class='time-text'>" + formatT(web_time_history[idx]) + "</text>";
+    }
+  }
+  a_tmp += "400,135 0,135";
+  html += "<polygon class='area-path' points='" + a_tmp + "' fill='url(#g-temp)' /><polyline class='line-path' points='" + l_tmp + "' stroke='" + tempColor + "' />" + t_tmp + "</svg></div></div>";
+  // --- CARD 3: HUMIDITY ---
+  html += "<div class='card'><div class='label'>Humidity | 5-Min History</div><div class='value' style='color:" + humColor + ";'>" + String(hum, 0) + "<span style='font-size:0.3em;color:#6b7c96;font-weight:400;margin-left:5px;'>%</span></div>";
+  html += "<div class='graph-container'><svg viewBox='0 0 400 165' width='100%' height='100%'><defs><linearGradient id='g-hum' x1='0%' y1='0%' x2='0%' y2='100%'><stop offset='0%' stop-color='" + humColor + "'/><stop offset='100%' stop-color='transparent'/></linearGradient></defs>";
+  html += "<line x1='0' y1='15' x2='400' y2='15' stroke='#161b26' stroke-dasharray='4' /><line x1='0' y1='75' x2='400' y2='75' stroke='#161b26' stroke-dasharray='4' /><line x1='0' y1='135' x2='400' y2='135' stroke='#161b26' stroke-dasharray='4' />";
+  
+  String a_hum = ""; String l_hum = ""; String t_hum = "";
+  for (int i = 0; i < 24; i++) {
+    int idx = (web_history_index + (web_history_size - 24) + i) % web_history_size;
+    int x = (i * 400) / 23; float hv = web_hum_history[idx]; if (hv < 0.0) hv = 0.0; if (hv > 100.0) hv = 100.0; int y = 135 - map((int)hv, 0, 100, 15, 120);
+    if(i==0) a_hum = String(x) + "," + String(y) + " ";
+    a_hum += String(x) + "," + String(y) + " "; l_hum += String(x) + "," + String(y) + " ";
+    if (i % 4 == 0) {
+      // FIXED: Added an offset buffer padding (+12px) to the very first node string to avoid layout screen clipping
+      int text_x = (i == 0) ? (x + 12) : ((i == 20) ? (x - 8) : x);
+      t_hum += "<text x='" + String(text_x) + "' y='" + String(y - 6) + "' fill='" + humColor + "' class='chart-text'>" + String((int)hv) + "%</text>";
+      t_hum += "<text x='" + String(text_x) + "' y='154' class='time-text'>" + formatT(web_time_history[idx]) + "</text>";
+    }
+  }
+  a_hum += "400,135 0,135";
+  html += "<polygon class='area-path' points='" + a_hum + "' fill='url(#g-hum)' /><polyline class='line-path' points='" + l_hum + "' stroke='" + humColor + "' />" + t_hum + "</svg></div></div>";
+
+  // --- CARD 4: PRESSURE ATMOSPHERIC ---
+  html += "<div class='card'><div class='label'>Atmospheric Pressure | 5-Min History</div><div class='value' style='color:#00ffcc;'>" + String(press, 1) + "<span style='font-size:0.3em;color:#6b7c96;font-weight:400;margin-left:5px;'>hPa</span></div>";
+  html += "<div class='graph-container'><svg viewBox='0 0 400 165' width='100%' height='100%'><defs><linearGradient id='g-press' x1='0%' y1='0%' x2='0%' y2='100%'><stop offset='0%' stop-color='#00ffcc'/><stop offset='100%' stop-color='transparent'/></linearGradient></defs>";
+  html += "<line x1='0' y1='15' x2='400' y2='15' stroke='#161b26' stroke-dasharray='4' /><line x1='0' y1='75' x2='400' y2='75' stroke='#161b26' stroke-dasharray='4' /><line x1='0' y1='135' x2='400' y2='135' stroke='#161b26' stroke-dasharray='4' />";
+  
+  String a_prs = ""; String l_prs = ""; String t_prs = "";
+  for (int i = 0; i < 24; i++) {
+    int idx = (web_history_index + (web_history_size - 24) + i) % web_history_size;
+    int x = (i * 400) / 23; float pv = web_press_history[idx]; if (pv < 950.0) pv = 950.0; if (pv > 1050.0) pv = 1050.0; int y = 135 - map((int)pv, 950, 1050, 15, 120);
+    if(i==0) a_prs = String(x) + "," + String(y) + " ";
+    a_prs += String(x) + "," + String(y) + " "; l_prs += String(x) + "," + String(y) + " ";
+    if (i % 4 == 0) {
+      // FIXED: Added an offset buffer padding (+12px) to the very first node string to avoid layout screen clipping
+      int text_x = (i == 0) ? (x + 12) : ((i == 20) ? (x - 8) : x);
+      t_prs += "<text x='" + String(text_x) + "' y='" + String(y - 6) + "' fill='#00ffcc' class='chart-text'>" + String(web_press_history[idx], 1) + "</text>";
+      t_prs += "<text x='" + String(text_x) + "' y='154' class='time-text'>" + formatT(web_time_history[idx]) + "</text>";
+    }
+  }
+  a_prs += "400,135 0,135";
+  html += "<polygon class='area-path' points='" + a_prs + "' fill='url(#g-press)' /><polyline class='line-path' points='" + l_prs + "' stroke='#00ffcc' />" + t_prs + "</svg></div></div>";
+
+  // --- CARD 5: 24H ABSOLUTE PICKS LAB TELEMETRY TABLE ---
+  html += "<div class='card'><div class='label' style='color:#00ffcc;'>24-HOUR ABSOLUTE RECORDS</div>";
+  html += "<table class='telemetry-table'><thead><tr><th>Metric</th><th>Minimum</th><th>Time</th><th>Maximum</th><th>Time</th></tr></thead><tbody>";
+  html += "<tr><td><b>VOC</b></td><td style='color:#00ffcc;'>" + String(global_min_voc == 999 ? 0 : global_min_voc) + "</td><td class='t-stamp'>" + formatT(g_min_voc_t) + "</td><td style='color:#ff3355;'>" + String(global_max_voc == -1 ? 0 : global_max_voc) + "</td><td class='t-stamp'>" + formatT(g_max_voc_t) + "</td></tr>";
+  html += "<tr><td><b>TEMP</b></td><td style='color:#00ffcc;'>" + String(global_min_tmp == 99.0 ? 0.0 : global_min_tmp, 1) + "°</td><td class='t-stamp'>" + formatT(g_min_tmp_t) + "</td><td style='color:#ff3355;'>" + String(global_max_tmp == -99.0 ? 0.0 : global_max_tmp, 1) + "°</td><td class='t-stamp'>" + formatT(g_max_tmp_t) + "</td></tr>";
+  html += "<tr><td><b>HUM</b></td><td style='color:#00ffcc;'>" + String(global_min_hum == 101.0 ? 0 : (int)global_min_hum) + "%</td><td class='t-stamp'>" + formatT(g_min_hum_t) + "</td><td style='color:#ff3355;'>" + String(global_max_hum == -1.0 ? 0 : (int)global_max_hum) + "%</td><td class='t-stamp'>" + formatT(g_max_hum_t) + "</td></tr>";
+  html += "<tr><td><b>PRES</b></td><td style='color:#00ffcc;'>" + String(global_min_prs == 9999.0 ? 0 : (int)global_min_prs) + "</td><td class='t-stamp'>" + formatT(g_min_prs_t) + "</td><td style='color:#ff3355;'>" + String(global_max_prs == -1.0 ? 0 : global_max_prs) + "</td><td class='t-stamp'>" + formatT(g_max_prs_t) + "</td></tr>";
+  html += "</tbody></table></div></div></body></html>";
+
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache"); server.sendHeader("Expires", "0");
+  server.send(200, "text/html", html);
+}
+void drawRaceGauge(int32_t value) {
+  int center_x = 160, center_y = 118, radius = 110;
+  int v = (value < 0) ? 0 : ((value > 500) ? 500 : value);
+  int active_segments = map(v, 0, 500, 0, 24); 
+  for (int i = 0; i < 24; i++) {
+    float angle = (180.0 - (i * 7.82)) * 3.14159 / 180.0;
+    uint16_t block_color = DARK_PANEL; 
+    if (i < active_segments) {
+      block_color = (i < 10) ? ST77XX_GREEN : ((i < 19) ? NEON_ORANGE : ST77XX_RED);
+    }
+    int x_start = center_x + (int)((radius - 12) * cos(angle));
+    int y_start = center_y - (int)((radius - 12) * sin(angle));
+    int x_end   = center_x + (int)(radius * cos(angle));
+    int y_end   = center_y - (int)(radius * sin(angle));
+    tft.drawLine(x_start, y_start, x_end, y_end, block_color);
+  }
+}
+
+uint16_t getEncodedTime() {
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){ return 0; }
+  return (timeinfo.tm_hour * 100) + timeinfo.tm_min;
+}
+
+void loadSavedHistory() {
+  prefs.begin("airmon", true); 
+  history_index = prefs.getInt("h_idx", 0); web_history_index = prefs.getInt("w_h_idx", 0);
+  prefs.getBytes("voc_h", voc_history, sizeof(voc_history));
+  prefs.getBytes("tmp_h", temp_history, sizeof(temp_history));
+  prefs.getBytes("hum_h", hum_history, sizeof(hum_history));
+  prefs.getBytes("prs_h", press_history, sizeof(press_history));
+  prefs.getBytes("w_voc_h", web_voc_history, sizeof(web_voc_history));
+  prefs.getBytes("w_tmp_h", web_temp_history, sizeof(web_temp_history));
+  prefs.getBytes("w_hum_h", web_hum_history, sizeof(web_hum_history));
+  prefs.getBytes("w_prs_h", web_press_history, sizeof(web_press_history));
+  prefs.getBytes("w_tim_h", web_time_history, sizeof(web_time_history));
+  global_max_voc = prefs.getInt("g_mx_v", -1); global_min_voc = prefs.getInt("g_mn_v", 999);
+  g_max_voc_t = prefs.getUInt("g_mx_vt", 0);   g_min_voc_t = prefs.getUInt("g_mn_vt", 0);
+  global_max_tmp = prefs.getFloat("g_mx_t", -99.0); global_min_tmp = prefs.getFloat("g_mn_t", 99.0);
+  g_max_tmp_t = prefs.getUInt("g_mx_tt", 0);   g_min_tmp_t = prefs.getUInt("g_mn_tt", 0);
+  global_max_hum = prefs.getFloat("g_mx_h", -1.0);  global_min_hum = prefs.getFloat("g_mn_h", 101.0);
+  g_max_hum_t = prefs.getUInt("g_mx_ht", 0);   g_min_hum_t = prefs.getUInt("g_mn_ht", 0);
+  global_max_prs = prefs.getFloat("g_mx_p", -1.0);  global_min_prs = prefs.getFloat("g_mn_p", 9999.0);
+  g_max_prs_t = prefs.getUInt("g_mx_pt", 0);   g_min_prs_t = prefs.getUInt("g_mn_p", 9999);
+  prefs.end();
+}
+
+void saveCurrentHistory() {
+  prefs.begin("airmon", false); 
+  prefs.putInt("h_idx", history_index); prefs.putInt("w_h_idx", web_history_index);
+  prefs.putBytes("voc_h", voc_history, sizeof(voc_history));
+  prefs.putBytes("tmp_h", temp_history, sizeof(temp_history));
+  prefs.putBytes("hum_h", hum_history, sizeof(hum_history));
+  prefs.putBytes("prs_h", press_history, sizeof(press_history));
+  prefs.putBytes("w_voc_h", web_voc_history, sizeof(web_voc_history));
+  prefs.putBytes("w_tmp_h", web_temp_history, sizeof(web_temp_history));
+  prefs.putBytes("w_hum_h", web_hum_history, sizeof(web_hum_history));
+  prefs.putBytes("w_prs_h", web_press_history, sizeof(web_press_history));
+  prefs.putBytes("w_tim_h", web_time_history, sizeof(web_time_history));
+  prefs.putInt("g_mx_v", global_max_voc); prefs.putInt("g_mn_v", global_min_voc);
+  prefs.putUInt("g_mx_vt", g_max_voc_t);  prefs.putUInt("g_mn_vt", g_min_voc_t);
+  prefs.putFloat("g_mx_t", global_max_tmp); prefs.putFloat("g_mn_t", global_min_tmp);
+  prefs.putUInt("g_mx_tt", g_max_tmp_t);  prefs.putUInt("g_mn_tt", g_min_tmp_t);
+  prefs.putFloat("g_mx_h", global_max_hum); prefs.putFloat("g_mn_h", global_min_hum);
+  prefs.putUInt("g_mx_ht", g_max_hum_t);  prefs.putUInt("g_mn_ht", g_min_hum_t);
+  prefs.putFloat("g_mx_p", global_max_prs); prefs.putFloat("g_mn_p", global_min_prs);
+  prefs.putUInt("g_mx_pt", g_max_prs_t);  prefs.putUInt("g_mn_p", g_min_prs_t);
+  prefs.end();
+}
+
+void setup() {
+  Serial.begin(115200); delay(1000); 
+  prefs.begin("airmon", false); prefs.clear(); prefs.end(); 
+  tft.init(240, 320, SPI_MODE3); tft.setRotation(3); tft.invertDisplay(true);      
+  tft.setAddrWindow(0, 0, 320, 240); tft.fillScreen(ST77XX_BLACK); 
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, password);
+  int w_t = 0; while (WiFi.status() != WL_CONNECTED && w_t < 40) { delay(500); w_t++; }
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  struct tm t_inf; int n_r = 0; while(!getLocalTime(&t_inf) && n_r < 30) { delay(1000); n_r++; }
+  ArduinoOTA.setHostname("XIAO-Air-Monitor"); ArduinoOTA.begin();
+  Wire.begin(5, 6); Wire.setClock(100000);
+  bme_detected = bme.begin(0x76, &Wire); if (!bme_detected) bme_detected = bme.begin(0x77, &Wire); 
+  sgp41.begin(Wire); server.on("/", handleRoot); server.begin();
+  
+  float i_t = bme_detected ? (bme.readTemperature() - 5.5) : 22.0;
+  float i_h = bme_detected ? bme.readHumidity() : 45.0;
+  float i_p = bme_detected ? (bme.readPressure() / 100.0) : 1013.2;
+  
+  // FIXED: Linearly spreads fake database timestamps going backward into the past to prevent chart overlap cluttering
+  int base_h = t_inf.tm_hour; int base_m = t_inf.tm_min;
+  for(int i = 0; i < history_size; i++) { voc_history[i] = 100; temp_history[i] = i_t; hum_history[i] = i_h; press_history[i] = i_p; }
+  for(int i = 0; i < web_history_size; i++) { 
+    web_voc_history[i] = 100; web_temp_history[i] = i_t; web_hum_history[i] = i_h; web_press_history[i] = i_p; 
+    int back_m = base_m - ((web_history_size - 1 - i) * 5);
+    int calc_h = base_h + (back_m / 60); int calc_m = back_m % 60;
+    if (calc_m < 0) { calc_m += 60; calc_h -= 1; }
+    if (calc_h < 0) { calc_h = (calc_h % 24) + 24; }
+    web_time_history[i] = ((calc_h % 24) * 100) + calc_m;
+  }
+  loadSavedHistory();
+  tft.fillScreen(ST77XX_BLACK); 
+  tft.drawRoundRect(6, 145, 98, 88, 8, DARK_PANEL);   
+  tft.drawRoundRect(111, 145, 98, 88, 8, DARK_PANEL); 
+  tft.drawRoundRect(216, 145, 98, 88, 8, DARK_PANEL); 
+  tft.setTextSize(1); tft.setTextColor(TEXT_MUTED, ST77XX_BLACK); 
+  tft.setCursor(120, 115); tft.print("AIR QUALITY"); tft.setCursor(12, 153); tft.print("TEMPERATURE"); tft.setCursor(117, 153); tft.print("HUMIDITY"); tft.setCursor(222, 153); tft.print("PRESSURE");      
+}
+
+void loop() {
+  server.handleClient(); ArduinoOTA.handle(); 
+  const float TEMP_OFFSET = 5.5; 
+  static unsigned long l_TFT = 0;
+  if (millis() - l_TFT > 500) {
+    l_TFT = millis();
+    uint16_t v_c = (voc_index > 150) ? ((voc_index > 250) ? ST77XX_RED : NEON_ORANGE) : ST77XX_GREEN; 
+    drawRaceGauge(voc_index);
+    tft.setTextSize(3); tft.setTextColor(v_c, ST77XX_BLACK); tft.setCursor(130, 80); tft.print(String(voc_index) + " "); 
+    tft.setTextSize(1); tft.setCursor(195, 94); tft.print("idx");
+    uint16_t t_c = ST77XX_GREEN; if (temp < 19.0) t_c = NEON_CYAN; else if (temp >= 28.0) t_c = ST77XX_RED; else if (temp > 24.5) t_c = NEON_ORANGE; 
+    tft.setTextSize(2); tft.setTextColor(t_c, ST77XX_BLACK); tft.setCursor(12, 185); tft.print(String(temp, 1) + "C"); 
+    uint16_t h_c = ST77XX_GREEN; if (hum < 35.0) h_c = NEON_ORANGE; else if (hum >= 75.0) h_c = ST77XX_RED; else if (hum > 60.0) h_c = ST77XX_BLUE;   
+    tft.setTextSize(2); tft.setTextColor(h_c, ST77XX_BLACK); tft.setCursor(117, 185); tft.print(String(hum, 0) + "%"); 
+    tft.setTextSize(2); tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK); tft.setCursor(220, 185); tft.print(String((int)press));
+    tft.setTextSize(1); tft.setCursor(220, 208); tft.print("hPa");
+    static bool tog = false; tft.fillRect(302, 10, 4, 4, tog ? v_c : ST77XX_BLACK); tog = !tog;
+  }
+  static unsigned long l_Up = 0;
+  if (millis() - l_Up > 1500) {
+    l_Up = millis();
+    if (bme_detected) {
+      float r_t = bme.readTemperature(); float r_h = bme.readHumidity();
+      press = bme.readPressure() / 100.0; temp = r_t - TEMP_OFFSET;
+      float es_r = 0.6112 * exp((17.67 * r_t) / (r_t + 243.5));
+      float e_ac = (r_h / 100.0) * es_r;
+      float es_c = 0.6112 * exp((17.67 * temp) / (temp + 243.5));
+      hum = (e_ac / es_c) * 100.0; if (hum > 100.0) hum = 100.0; if (hum < 0.0) hum = 0.0;
+      uint16_t r_v = 0, r_n = 0;
+      uint16_t err = sgp41.measureRawSignals((uint16_t)(hum * 65535 / 100), (uint16_t)((temp + 45) * 65535 / 175), r_v, r_n);
+      if (err == 0 && r_v != 0 && r_v != 65535) {
+        int32_t r_idx = voc_alg.process(r_v); voc_index = (r_idx <= 0) ? 100 : r_idx;
+      } else { voc_index = 100; }
+      voc_sum_accumulator += voc_index; temp_sum_accumulator += temp; hum_sum_accumulator += hum; press_sum_accumulator += press; voc_samples_counter++;
+    } else { temp = 24.2; hum = 46.0; press = 1013.2; voc_index = 100; }
+    voc_history[history_index] = voc_index; temp_history[history_index] = temp; hum_history[history_index] = hum; press_history[history_index] = press;
+    history_index = (history_index + 1) % history_size; saveCurrentHistory();
+    if (millis() - last20MinUpdate > 10000) { // 10 seconds rapid loop active
+      last20MinUpdate = millis();
+      int v_avg = (voc_samples_counter > 0) ? (voc_sum_accumulator / voc_samples_counter) : voc_index;
+      float t_avg = (voc_samples_counter > 0) ? (temp_sum_accumulator / voc_samples_counter) : temp;
+      float h_avg = (voc_samples_counter > 0) ? (hum_sum_accumulator / voc_samples_counter) : hum;
+      float p_avg = (voc_samples_counter > 0) ? (press_sum_accumulator / voc_samples_counter) : press;
+      uint16_t c_t = getEncodedTime();
+      if(v_avg > global_max_voc) { global_max_voc = v_avg; g_max_voc_t = c_t; }
+      if(v_avg < global_min_voc || global_min_voc == 999) { global_min_voc = v_avg; g_min_voc_t = c_t; }
+      if(t_avg > global_max_tmp) { global_max_tmp = t_avg; g_max_tmp_t = c_t; }
+      if(t_avg < global_min_tmp || global_min_tmp == 99.0) { global_min_tmp = t_avg; g_min_tmp_t = c_t; }
+      if(h_avg > global_max_hum) { global_max_hum = h_avg; g_max_hum_t = c_t; }
+      if(h_avg < global_min_hum || global_min_hum == 101.0) { global_min_hum = h_avg; g_min_hum_t = c_t; }
+if(p_avg > global_max_prs) { global_max_prs = p_avg; g_max_prs_t = c_t; }
+if(p_avg < global_min_prs || global_min_prs == 9999.0) { global_min_prs = p_avg; 
+g_min_prs_t = c_t; }
+voc_sum_accumulator = 0; temp_sum_accumulator = 0.0; hum_sum_accumulator = 0.0; 
+press_sum_accumulator = 0.0; voc_samples_counter = 0;
+web_voc_history[web_history_index] = v_avg; 
+web_temp_history[web_history_index] = t_avg; 
+web_hum_history[web_history_index] = h_avg; 
+web_press_history[web_history_index] = p_avg;
+web_time_history[web_history_index] = c_t; saveCurrentHistory();
+web_history_index = (web_history_index + 1) % web_history_size;
+
+  }
+}
+}
