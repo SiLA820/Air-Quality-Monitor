@@ -12,16 +12,20 @@
 #include <Preferences.h>     
 #include "time.h"            
 
+// --- Wi-Fi Home Router Credentials ---
 const char* ssid = "YOUR_WIFI";
 const char* password = "YOUR_PASSWORD";
+
+// Italian National Metrology Institute NTP Server Configuration
 const char* ntpServer = "193.204.114.232"; 
 const long  gmtOffset_sec = 0;     
 const int   daylightOffset_sec = 3600; 
 
-#define TFT_CS   2   
-#define TFT_DC   3   
-#define TFT_RST  4   
+#define TFT_CS   2   // Xiao Pin D1
+#define TFT_DC   3   // Xiao Pin D2
+#define TFT_RST  4   // Xiao Pin D3
 
+// 16-bit Automotive Cluster Color Palette (565 format)
 #define NEON_ORANGE  0xFDA0  
 #define NEON_CYAN    0x07FF  
 #define NEON_GREEN   0x07E0  
@@ -41,6 +45,7 @@ int32_t voc_index = 100, last_voc = -1;
 unsigned long lastUpdate = 0, lastTFTUpdate = 0;
 bool bme_detected = false, wifi_connected_prev = false;
 
+// Real-Time Local TFT history arrays (40 points database size tracking)
 const int history_size = 40; 
 int voc_history[history_size]; 
 float temp_history[history_size];
@@ -48,6 +53,7 @@ float hum_history[history_size];
 float press_history[history_size]; 
 int history_index = 0;
 
+// Database split buffer layout storing 24-Hours (288 nodes) for tables, keeping charts rendering light
 const int web_history_size = 288;
 int web_voc_history[web_history_size]; 
 float web_temp_history[web_history_size];
@@ -56,6 +62,7 @@ float web_press_history[web_history_size];
 uint16_t web_time_history[web_history_size]; 
 int web_history_index = 0;
 
+// Non-volatile standalone registers caching the absolute 24H picks safely below NVS 4096 byte limits
 int global_max_voc = -1, global_min_voc = 999; uint16_t g_max_voc_t = 0, g_min_voc_t = 0;
 float global_max_tmp = -99.0, global_min_tmp = 99.0; uint16_t g_max_tmp_t = 0, g_min_tmp_t = 0;
 float global_max_hum = -1.0, global_min_hum = 101.0; uint16_t g_max_hum_t = 0, g_min_hum_t = 0;
@@ -63,10 +70,6 @@ float global_max_prs = -1.0, global_min_prs = 9999.0; uint16_t g_max_prs_t = 0, 
 
 unsigned long last20MinUpdate = 0, voc_sum_accumulator = 0, voc_samples_counter = 0;
 float temp_sum_accumulator = 0.0, hum_sum_accumulator = 0.0, press_sum_accumulator = 0.0;
-// --- Local Web Dashboard HTML Generation ---
-// --- Local Web Dashboard HTML Generation ---
-// --- Local Web Dashboard HTML Generation ---
-// --- Local Web Dashboard HTML Generation ---
 // --- Local Web Dashboard HTML Generation ---
 void handleRoot() {
   int max_v = -1, min_v = 999; uint16_t max_vt = 0, min_vt = 0;
@@ -125,7 +128,6 @@ void handleRoot() {
     if(i==0) a_voc = String(x) + "," + String(y) + " ";
     a_voc += String(x) + "," + String(y) + " "; l_voc += String(x) + "," + String(y) + " ";
     if (i % 4 == 0) { 
-      // FIXED: Added an offset buffer padding (+12px) to the very first node string to avoid layout screen clipping
       int text_x = (i == 0) ? (x + 12) : ((i == 20) ? (x - 8) : x);
       t_voc += "<text x='" + String(text_x) + "' y='" + String(y - 6) + "' fill='" + vocColor + "' class='chart-text'>" + String(val) + "</text>";
       t_voc += "<text x='" + String(text_x) + "' y='154' class='time-text'>" + formatT(web_time_history[idx]) + "</text>";
@@ -164,7 +166,6 @@ void handleRoot() {
     if(i==0) a_hum = String(x) + "," + String(y) + " ";
     a_hum += String(x) + "," + String(y) + " "; l_hum += String(x) + "," + String(y) + " ";
     if (i % 4 == 0) {
-      // FIXED: Added an offset buffer padding (+12px) to the very first node string to avoid layout screen clipping
       int text_x = (i == 0) ? (x + 12) : ((i == 20) ? (x - 8) : x);
       t_hum += "<text x='" + String(text_x) + "' y='" + String(y - 6) + "' fill='" + humColor + "' class='chart-text'>" + String((int)hv) + "%</text>";
       t_hum += "<text x='" + String(text_x) + "' y='154' class='time-text'>" + formatT(web_time_history[idx]) + "</text>";
@@ -185,7 +186,6 @@ void handleRoot() {
     if(i==0) a_prs = String(x) + "," + String(y) + " ";
     a_prs += String(x) + "," + String(y) + " "; l_prs += String(x) + "," + String(y) + " ";
     if (i % 4 == 0) {
-      // FIXED: Added an offset buffer padding (+12px) to the very first node string to avoid layout screen clipping
       int text_x = (i == 0) ? (x + 12) : ((i == 20) ? (x - 8) : x);
       t_prs += "<text x='" + String(text_x) + "' y='" + String(y - 6) + "' fill='#00ffcc' class='chart-text'>" + String(web_press_history[idx], 1) + "</text>";
       t_prs += "<text x='" + String(text_x) + "' y='154' class='time-text'>" + formatT(web_time_history[idx]) + "</text>";
@@ -276,7 +276,6 @@ void saveCurrentHistory() {
   prefs.putUInt("g_mx_pt", g_max_prs_t);  prefs.putUInt("g_mn_p", g_min_prs_t);
   prefs.end();
 }
-
 void setup() {
   Serial.begin(115200); delay(1000); 
   prefs.begin("airmon", false); prefs.clear(); prefs.end(); 
@@ -295,7 +294,6 @@ void setup() {
   float i_h = bme_detected ? bme.readHumidity() : 45.0;
   float i_p = bme_detected ? (bme.readPressure() / 100.0) : 1013.2;
   
-  // FIXED: Linearly spreads fake database timestamps going backward into the past to prevent chart overlap cluttering
   int base_h = t_inf.tm_hour; int base_m = t_inf.tm_min;
   for(int i = 0; i < history_size; i++) { voc_history[i] = 100; temp_history[i] = i_t; hum_history[i] = i_h; press_history[i] = i_p; }
   for(int i = 0; i < web_history_size; i++) { 
@@ -352,7 +350,7 @@ void loop() {
     } else { temp = 24.2; hum = 46.0; press = 1013.2; voc_index = 100; }
     voc_history[history_index] = voc_index; temp_history[history_index] = temp; hum_history[history_index] = hum; press_history[history_index] = press;
     history_index = (history_index + 1) % history_size; saveCurrentHistory();
-    if (millis() - last20MinUpdate > 10000) { // 10 seconds rapid loop active
+    if (millis() - last20MinUpdate > 300000) { 
       last20MinUpdate = millis();
       int v_avg = (voc_samples_counter > 0) ? (voc_sum_accumulator / voc_samples_counter) : voc_index;
       float t_avg = (voc_samples_counter > 0) ? (temp_sum_accumulator / voc_samples_counter) : temp;
@@ -365,18 +363,12 @@ void loop() {
       if(t_avg < global_min_tmp || global_min_tmp == 99.0) { global_min_tmp = t_avg; g_min_tmp_t = c_t; }
       if(h_avg > global_max_hum) { global_max_hum = h_avg; g_max_hum_t = c_t; }
       if(h_avg < global_min_hum || global_min_hum == 101.0) { global_min_hum = h_avg; g_min_hum_t = c_t; }
-if(p_avg > global_max_prs) { global_max_prs = p_avg; g_max_prs_t = c_t; }
-if(p_avg < global_min_prs || global_min_prs == 9999.0) { global_min_prs = p_avg; 
-g_min_prs_t = c_t; }
-voc_sum_accumulator = 0; temp_sum_accumulator = 0.0; hum_sum_accumulator = 0.0; 
-press_sum_accumulator = 0.0; voc_samples_counter = 0;
-web_voc_history[web_history_index] = v_avg; 
-web_temp_history[web_history_index] = t_avg; 
-web_hum_history[web_history_index] = h_avg; 
-web_press_history[web_history_index] = p_avg;
-web_time_history[web_history_index] = c_t; saveCurrentHistory();
-web_history_index = (web_history_index + 1) % web_history_size;
-
+      if(p_avg > global_max_prs) { global_max_prs = p_avg; g_max_prs_t = c_t; }
+      if(p_avg < global_min_prs || global_min_prs == 9999.0) { global_min_prs = p_avg; g_min_prs_t = c_t; }
+      voc_sum_accumulator = 0; temp_sum_accumulator = 0.0; hum_sum_accumulator = 0.0; press_sum_accumulator = 0.0; voc_samples_counter = 0;
+      web_voc_history[web_history_index] = v_avg; web_temp_history[web_history_index] = t_avg; web_hum_history[web_history_index] = h_avg; web_press_history[web_history_index] = p_avg;
+      web_time_history[web_history_index] = c_t; saveCurrentHistory();
+      web_history_index = (web_history_index + 1) % web_history_size;
+    }
   }
-}
 }
